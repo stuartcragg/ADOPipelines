@@ -1,0 +1,105 @@
+trigger:
+- main
+
+pool:
+  vmImage: 'windows-latest'
+
+variables:
+  sourceStorageAccount: '<source storage account>'  # Replace with your Premium Blob storage account name
+  sourceResourceGroup: '<source resource group>'  # Replace with the resource group of the source storage account
+  destinationStorageAccount: '<destination storage account>'  # Replace with your Standard Blob storage account name
+  destinationResourceGroup: '<destination resource group>'  # Replace with the resource group of the destination storage account
+  azureSubscription: '<service connection name>'  # Placeholder for your ARM service connection name
+  copyBlobs: 'true'  # Switch to enable blob syncing
+  overwriteExisting: 'true'  # Overwrite blobs in destination if true
+  deleteDestinationExtras: 'false'  # Delete blobs in destination not present in source if true
+  specificContainer: ''  # Optional: Sync only this container (leave empty for all)
+
+steps:
+- task: AzurePowerShell@5
+  displayName: 'Sync Blob Storage Data with SAS Tokens'
+  inputs:
+    azureSubscription: '$(azureSubscription)'
+    ScriptType: 'InlineScript'
+    Inline: |
+      # Suppress sensitive output from being logged
+      $PSDefaultParameterValues['*:Verbose'] = $false
+      $PSDefaultParameterValues['*:Debug'] = $false
+
+      # Download and install AzCopy
+      $azCopyUrl = "https://aka.ms/downloadazcopy-v10-windows"
+      Invoke-WebRequest -Uri $azCopyUrl -OutFile "azcopy.zip" -UseBasicParsing
+      Expand-Archive -Path "azcopy.zip" -DestinationPath "azcopy" -Force
+      $azCopyPath = (Get-ChildItem -Path "azcopy" -Recurse -File | Where-Object { $_.Name -eq "azcopy.exe" }).FullName
+
+      # Log AzCopy version for verification
+      $azCopyVersion = & $azCopyPath --version
+      Write-Host "AzCopy version installed: $azCopyVersion"
+
+      # Get storage account keys using explicit resource group names
+      $sourceKey = (Get-AzStorageAccountKey -ResourceGroupName "$(sourceResourceGroup)" -Name "$(sourceStorageAccount)").Value[0]
+      $destKey = (Get-AzStorageAccountKey -ResourceGroupName "$(destinationResourceGroup)" -Name "$(destinationStorageAccount)").Value[0]
+
+      # Generate storage contexts with keys
+      $sourceContext = New-AzStorageContext -StorageAccountName "$(sourceStorageAccount)" -StorageAccountKey $sourceKey
+      $destContext = New-AzStorageContext -StorageAccountName "$(destinationStorageAccount)" -StorageAccountKey $destKey
+
+      # Generate SAS tokens with blob-only access (read for source, read/write for destination)
+      $sasExpiry = (Get-Date).AddHours(1)
+      $sourceSas = New-AzStorageAccountSASToken -Service Blob -ResourceType Object -Permission "r" -ExpiryTime $sasExpiry -Context $sourceContext
+      $destSas = New-AzStorageAccountSASToken -Service Blob -ResourceType Object -Permission "rw" -ExpiryTime $sasExpiry -Context $destContext
+
+      # Define AzCopy arguments for sync (removed --output)
+      $azCopyArgs = @("--output-type=json", "--log-level=INFO")
+      if ([System.Convert]::ToBoolean("$(overwriteExisting)")) { $azCopyArgs += "--overwrite=true" } else { $azCopyArgs += "--overwrite=false" }
+      if ([System.Convert]::ToBoolean("$(deleteDestinationExtras)")) { $azCopyArgs += "--delete-destination=true" } else { $azCopyArgs += "--delete-destination=false" }
+      Write-Host "AzCopy arguments: $azCopyArgs"
+
+      # Get containers to sync
+      $containers = @()
+      if ([System.Convert]::ToBoolean("$(copyBlobs)")) {
+        if ("$(specificContainer)" -eq "") {
+          $containers = Get-AzStorageContainer -Context $sourceContext | Select-Object -ExpandProperty Name
+        } else {
+          $containers = "$(specificContainer)"
+        }
+      }
+
+      # Sync blobs and handle errors
+      $exitCode = 0
+      foreach ($container in $containers) {
+        Write-Host "Syncing blobs in container: $container"
+        $sourceUrl = "https://$(sourceStorageAccount).blob.core.windows.net/$container/$sourceSas"
+        $destUrl = "https://$(destinationStorageAccount).blob.core.windows.net/$container/$destSas"
+
+        # Run AzCopy sync
+        Write-Host "Running AzCopy command: & $azCopyPath sync $sourceUrl $destUrl --recursive=true"
+        & $azCopyPath sync $sourceUrl $destUrl --recursive=true
+        $lastExitCode = $LASTEXITCODE
+        if ($lastExitCode -ne 0) {
+          Write-Host "##vso[task.logissue type=error]AzCopy sync failed for container $container with exit code $lastExitCode"
+          $exitCode = $lastExitCode
+        }
+      }
+
+      # Publish AzCopy log as pipeline artifact (default log file)
+      $defaultLogPath = Join-Path (Get-Location) "AzCopy.log"
+      if (Test-Path $defaultLogPath) {
+        Write-Host "##vso[task.uploadfile]$defaultLogPath"
+        $logContent = Get-Content $defaultLogPath -Raw | ConvertFrom-Json
+        $filesTransferred = $logContent.summary.totalFileTransfers
+        $filesDeleted = $logContent.summary.totalDeletionCount
+        $errors = $logContent.summary.failedCount
+        Write-Host "Files transferred: $filesTransferred, Files deleted: $filesDeleted, Errors: $errors"
+      } else {
+        Write-Host "##vso[task.logissue type=warning]AzCopy default log file (AzCopy.log) not found."
+      }
+
+      # SAS tokens auto-expire after 1 hour; no explicit revocation needed
+
+      # Fail pipeline if any sync operation failed
+      if ($exitCode -ne 0) {
+        Write-Host "##vso[task.complete result=Failed]Sync operation encountered errors."
+      }
+    azurePowerShellVersion: 'LatestVersion'
+    errorActionPreference: 'Stop'
